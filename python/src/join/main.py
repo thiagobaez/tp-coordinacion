@@ -1,5 +1,6 @@
 import os
 import logging
+import bisect
 
 from common import middleware, message_protocol, fruit_item
 
@@ -22,11 +23,65 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.tops_by_client = {}  # {client_id: [FruitItem, ...]}
+
+    def _process_top(self, client_id, fruit_top_data):
+        """Agrega frutas del top parcial de un aggregator"""
+        logging.info(f"Processing top from client {client_id}")
+        
+        if client_id not in self.tops_by_client:
+            self.tops_by_client[client_id] = []
+        
+        # fruit_top_data es una lista de tuples (fruit, amount)
+        for fruit, amount in fruit_top_data:
+            # Buscar si la fruta ya existe
+            found = False
+            for i in range(len(self.tops_by_client[client_id])):
+                if self.tops_by_client[client_id][i].fruit == fruit:
+                    self.tops_by_client[client_id][i] = self.tops_by_client[client_id][i] + fruit_item.FruitItem(
+                        fruit, amount
+                    )
+                    found = True
+                    break
+            
+            if not found:
+                bisect.insort(self.tops_by_client[client_id], fruit_item.FruitItem(fruit, amount))
+
+    def _process_eof(self, client_id):
+        """Genera el top-3 final del cliente y envía al gateway"""
+        logging.info(f"Received EOF for client {client_id}")
+        
+        if client_id not in self.tops_by_client:
+            logging.warning(f"No tops found for client {client_id}")
+            return
+        
+        # Obtener los últimos TOP_SIZE elementos (top-3)
+        fruit_chunk = list(self.tops_by_client[client_id][-TOP_SIZE:])
+        fruit_chunk.reverse()
+        
+        fruit_top = [client_id] + list(
+            map(
+                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
+                fruit_chunk,
+            )
+        )
+        
+        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        del self.tops_by_client[client_id]
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        logging.info("Received message")
+        fields = message_protocol.internal.deserialize(message)
+        client_id = fields[0]
+        
+        if len(fields) > 1:
+            # Mensaje con datos: [client_id, (fruit, amount), ...]
+            fruit_top_data = fields[1:]
+            self._process_top(client_id, fruit_top_data)
+        else:
+            # Mensaje EOF: [client_id]
+            self._process_eof(client_id)
+        
         ack()
 
     def start(self):

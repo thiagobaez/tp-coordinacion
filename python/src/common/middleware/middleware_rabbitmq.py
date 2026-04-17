@@ -199,7 +199,13 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                     requeue=True
                 )
 
-                if on_message_callback.__code__.co_argcount == 3:
+                # Detectar si es un método (tiene __self__) o función
+                # Métodos tienen co_argcount = 4 (self + 3 parámetros)
+                # Funciones tienen co_argcount = 3 (3 parámetros)
+                is_method = hasattr(on_message_callback, '__self__')
+                argcount = on_message_callback.__code__.co_argcount
+                
+                if (is_method and argcount == 4) or (not is_method and argcount == 3):
                     on_message_callback(body, ack, nack)
                 else:
                     on_message_callback(body, method.routing_key, ack, nack)
