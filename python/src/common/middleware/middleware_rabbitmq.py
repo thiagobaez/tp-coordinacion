@@ -53,6 +53,38 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareMessageError(str(e))
 
+    def reserve_receiver_resources(self, on_message_callback):
+        """Registra el callback sin bloquear (permite múltiples consumers en el mismo channel)"""
+        def callback(ch, method, properties, body):
+            try:
+                ack = lambda: ch.basic_ack(delivery_tag=method.delivery_tag)
+                nack = lambda: ch.basic_nack(
+                    delivery_tag=method.delivery_tag,
+                    requeue=True
+                )
+
+                on_message_callback(body, ack, nack)
+
+            except Exception as e:
+                try:
+                    ch.basic_nack(
+                        delivery_tag=method.delivery_tag,
+                        requeue=True
+                    )
+                except:
+                    pass
+                raise MessageMiddlewareMessageError(str(e))
+
+        try:
+            self._check_connection()
+            self.consumer_tag = self.channel.basic_consume(
+                queue=self.queue_name,
+                on_message_callback=callback,
+                auto_ack=False
+            )
+        except pika.exceptions.AMQPError as e:
+            raise MessageMiddlewareDisconnectedError(str(e))
+
     def start_consuming(self, on_message_callback):
 
         def callback(ch, method, properties, body):
@@ -125,22 +157,30 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
-    def __init__(self, host, exchange_name, routing_keys):
+    def __init__(self, host, exchange_name, routing_keys, channel=None):
         self.host = host
         self.exchange_name = exchange_name
         self.routing_keys = routing_keys
         self._consumer_running = False
         self.consumer_tag = None
+        self._owns_connection = channel is None
 
         try:
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.host,
-                    heartbeat=600,
-                    blocked_connection_timeout=300
+            if channel is None:
+                # Crear nueva conexión
+                self.connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(
+                        host=self.host,
+                        heartbeat=600,
+                        blocked_connection_timeout=300
+                    )
                 )
-            )
-            self.channel = self.connection.channel()
+                self.channel = self.connection.channel()
+            else:
+                # Reutilizar channel existente
+                self.channel = channel
+                self.connection = getattr(channel, 'connection', None)
+
             self.channel.exchange_declare(
                 exchange=self.exchange_name,
                 exchange_type="topic",
@@ -165,7 +205,9 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             raise MessageMiddlewareDisconnectedError(str(e))
 
     def _check_connection(self):
-        if not self.connection.is_open or not self.channel.is_open:
+        if not self.channel.is_open:
+            raise MessageMiddlewareDisconnectedError("Conexión cerrada")
+        if self.connection and not self.connection.is_open:
             raise MessageMiddlewareDisconnectedError("Conexión cerrada")
 
     def send(self, message, routing_key=None):
@@ -189,6 +231,47 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
         except (pika.exceptions.AMQPError, IndexError) as e:
             raise MessageMiddlewareMessageError(str(e))
+
+    def reserve_receiver_resources(self, on_message_callback):
+        """Registra el callback sin bloquear (permite múltiples consumers en el mismo channel)"""
+        def callback(ch, method, properties, body):
+            try:
+                ack = lambda: ch.basic_ack(delivery_tag=method.delivery_tag)
+                nack = lambda: ch.basic_nack(
+                    delivery_tag=method.delivery_tag,
+                    requeue=True
+                )
+
+                # Detectar si es un método (tiene __self__) o función
+                is_method = hasattr(on_message_callback, '__self__')
+                argcount = on_message_callback.__code__.co_argcount
+                
+                if (is_method and argcount == 4) or (not is_method and argcount == 3):
+                    on_message_callback(body, ack, nack)
+                else:
+                    on_message_callback(body, method.routing_key, ack, nack)
+
+            except Exception as e:
+                try:
+                    ch.basic_nack(
+                        delivery_tag=method.delivery_tag,
+                        requeue=True
+                    )
+                except:
+                    pass
+                raise MessageMiddlewareMessageError(str(e))
+
+        try:
+            self._check_connection()
+
+            self.consumer_tag = self.channel.basic_consume(
+                queue=self.queue_name,
+                on_message_callback=callback,
+                auto_ack=False
+            )
+
+        except pika.exceptions.AMQPError as e:
+            raise MessageMiddlewareDisconnectedError(str(e))
 
     def start_consuming(self, on_message_callback):
 
@@ -259,11 +342,13 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             except:
                 pass
 
-            if self.channel.is_open:
-                self.channel.close()
+            # Solo cerrar conexión si la creamos nosotros
+            if self._owns_connection:
+                if self.channel and self.channel.is_open:
+                    self.channel.close()
 
-            if self.connection.is_open:
-                self.connection.close()
+                if self.connection and self.connection.is_open:
+                    self.connection.close()
 
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareCloseError(str(e))

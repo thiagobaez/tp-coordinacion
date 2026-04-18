@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -11,26 +12,38 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
+SUM_CONTROL_ROUTING_KEY = f"{SUM_CONTROL_EXCHANGE}_ALL"
 
 class SumFilter:
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
+        self.closed = False
+        self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
+        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+
+        self.control_exchange = None
+        if SUM_AMOUNT > 1:
+            self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_ROUTING_KEY], 
+                channel=self.input_queue.channel
+            )
+
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, ["#"]
-        )
-        self.amount_by_client = {}
 
-    def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Process data from client {client_id} with fruit: {fruit} and amount: {amount}")
-        
+        self.amount_by_client = {}
+        self.processed_clients = set() 
+
+    def handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.close()
+        if self._prev_sigterm_handler:
+            self._prev_sigterm_handler(signum, frame)
+
+    def _process_data(self, client_id, fruit, amount):        
         if client_id not in self.amount_by_client:
             self.amount_by_client[client_id] = {}
         
@@ -39,73 +52,111 @@ class SumFilter:
         ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _get_aggregator_index(self, client_id, fruit):
-        """Determina el índice del aggregator usando sharding por client_id y fruta"""
-        return (client_id + hash(fruit)) % AGGREGATION_AMOUNT
+        fruit_hash = sum(ord(c) for c in fruit)
+        return (client_id + fruit_hash) % AGGREGATION_AMOUNT
 
-    def _process_eof(self, client_id):
-        logging.info(f"Broadcasting data messages for client {client_id}")
-        aggregators_used = set()
+    def _send_to_aggregators(self, client_id):        
+        if client_id not in self.amount_by_client:
+            return
         
-        if client_id in self.amount_by_client:
-            for final_fruit_item in self.amount_by_client[client_id].values():
-                aggregator_index = self._get_aggregator_index(client_id, final_fruit_item.fruit)
-                aggregators_used.add(aggregator_index)
-                data_output_exchange = self.data_output_exchanges[aggregator_index]
-                
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
-
-            logging.info(f"Broadcasting EOF message for client {client_id}")
-            for aggregator_index in aggregators_used:
-                self.data_output_exchanges[aggregator_index].send(
-                    message_protocol.internal.serialize([client_id])
-                )
+        logging.info(f"Enviando datos a agregadores: cliente {client_id}")
+        for final_fruit_item in self.amount_by_client[client_id].values():
+            aggregator_index = self._get_aggregator_index(client_id, final_fruit_item.fruit)
+            data_output_exchange = self.data_output_exchanges[aggregator_index]
             
-            del self.amount_by_client[client_id]
+            data_output_exchange.send(
+                message_protocol.internal.serialize(
+                    [client_id, final_fruit_item.fruit, final_fruit_item.amount]
+                )
+            )
         
-        # Publicar EOF al fanout para coordinación entre múltiples Sums
-        if SUM_AMOUNT > 1:
-            logging.info(f"Publishing EOF broadcast for client {client_id}")
-            self.control_exchange.send(
+        for aggregator_index in range(AGGREGATION_AMOUNT):
+            self.data_output_exchanges[aggregator_index].send(
                 message_protocol.internal.serialize([client_id])
             )
+        
+        del self.amount_by_client[client_id]
+
+    def _process_eof(self, client_id):
+        if client_id in self.processed_clients:
+            return
+        
+        self.processed_clients.add(client_id)
+        self._send_to_aggregators(client_id)      
+        if SUM_AMOUNT > 1:
+            self.control_exchange.send(message_protocol.internal.serialize([client_id]))
 
 
     def _on_eof_broadcast(self, message, ack, nack):
-        """Maneja notificaciones de EOF desde otros Sums"""
-        fields = message_protocol.internal.deserialize(message)
-        client_id = fields[0]
-        
-        logging.info(f"Received EOF broadcast for client {client_id}")
-        
-        # Solo procesar si tengo datos para este cliente
-        if client_id in self.amount_by_client:
-            logging.info(f"Processing EOF for client {client_id} from broadcast")
-            self._process_eof(client_id)
-        
-        ack()
+        """Recibe notificación de EOF desde otros Sums: envía datos acumulados"""
+        if self.closed:
+            ack()
+            return
+        try:
+            fields = message_protocol.internal.deserialize(message)
+            client_id = fields[0]
+            
+            logging.info(f"EOF broadcast recibido de otro Sum: cliente {client_id}")
+                    
+            if client_id in self.processed_clients:
+                ack()
+                return
+            
+            self.processed_clients.add(client_id)
+            self._send_to_aggregators(client_id)
+            
+            ack()
+        except Exception as e:
+            logging.error(f"Error processing EOF broadcast: {e}")
+            nack()
 
     def process_data_messsage(self, message, ack, nack):
+        if self.closed:
+            ack()
+            return
         fields = message_protocol.internal.deserialize(message)
         client_id = fields[0]
         
         if len(fields) == 3:
             self._process_data(client_id, fields[1], fields[2])
         else:
+            logging.info(f"EOF recibido: cliente {client_id}")
             self._process_eof(client_id)
         ack()
 
     def start(self):
-        # Consumir datos de INPUT_QUEUE
-        self.input_queue.start_consuming(self.process_data_messsage)
+        self.input_queue.reserve_receiver_resources(self.process_data_messsage)
+        if SUM_AMOUNT > 1:
+            self.control_exchange.reserve_receiver_resources(self._on_eof_broadcast)
+        self.input_queue.channel.start_consuming()
+
+    def close(self):
+        """Cierra todas las conexiones y canales"""
+        try:
+            self.closed = True
+            self.input_queue.stop_consuming()
+            if SUM_AMOUNT > 1 and self.control_exchange:
+                self.control_exchange.close()
+            for exchange in self.data_output_exchanges:
+                if exchange:
+                    exchange.close()
+            if self.input_queue:
+                self.input_queue.close()
+        except Exception as e:
+            logging.error(f"Error closing resources: {e}")
 
 def main():
+    logging.getLogger("pika").setLevel(logging.WARNING)
+    logging.getLogger("pika.adapters").setLevel(logging.WARNING)
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
+    try:
+        sum_filter.start()
+    except Exception as e:
+        logging.error(f"Error in sum_filter: {e}")
+        return 1
+    finally:
+        sum_filter.close()
     return 0
 
 
