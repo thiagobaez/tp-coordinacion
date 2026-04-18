@@ -23,7 +23,7 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.tops_by_client = {}  # {client_id: [FruitItem, ...]}
+        self.tops_by_client = {}
 
     def _process_top(self, client_id, fruit_top_data):
         """Agrega frutas del top parcial de un aggregator"""
@@ -32,9 +32,7 @@ class JoinFilter:
         if client_id not in self.tops_by_client:
             self.tops_by_client[client_id] = []
         
-        # fruit_top_data es una lista de tuples (fruit, amount)
         for fruit, amount in fruit_top_data:
-            # Buscar si la fruta ya existe
             found = False
             for i in range(len(self.tops_by_client[client_id])):
                 if self.tops_by_client[client_id][i].fruit == fruit:
@@ -58,6 +56,8 @@ class JoinFilter:
         # Obtener los últimos TOP_SIZE elementos (top-3)
         fruit_chunk = list(self.tops_by_client[client_id][-TOP_SIZE:])
         fruit_chunk.reverse()
+
+        print(f"Final top for client {client_id}: {[str(f) for f in fruit_chunk]}")
         
         fruit_top = [client_id] + list(
             map(
@@ -75,11 +75,9 @@ class JoinFilter:
         client_id = fields[0]
         
         if len(fields) > 1:
-            # Mensaje con datos: [client_id, (fruit, amount), ...]
             fruit_top_data = fields[1:]
             self._process_top(client_id, fruit_top_data)
         else:
-            # Mensaje EOF: [client_id]
             self._process_eof(client_id)
         
         ack()

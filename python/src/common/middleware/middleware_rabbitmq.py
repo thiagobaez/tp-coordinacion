@@ -168,14 +168,15 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         if not self.connection.is_open or not self.channel.is_open:
             raise MessageMiddlewareDisconnectedError("Conexión cerrada")
 
-    def send(self, message):
+    def send(self, message, routing_key=None):
         try:
             self._check_connection()
 
             if isinstance(message, str):
                 message = message.encode()
 
-            routing_key = self.routing_keys[0] if self.routing_keys else ""
+            if routing_key is None:
+                routing_key = self.routing_keys[0] if self.routing_keys else ""
 
             self.channel.basic_publish(
                 exchange=self.exchange_name,
