@@ -1,8 +1,11 @@
-# Trabajo Práctico - Coordinación
+# Trabajo Práctico Coordinación - Sistemas Distribuidos I (TA050)
 
-En este trabajo se busca familiarizar a los estudiantes con los desafíos de la coordinación del trabajo y el control de la complejidad en sistemas distribuidos. Para tal fin se provee un esqueleto de un sistema de control de stock de una verdulería y un conjunto de escenarios de creciente grado de complejidad y distribución que demandarán mayor sofisticación en la comunicación de las partes involucradas.
+### Alumno: Thiago Fernando Baez - Padrón: 110703
+ 
+## Informe: Coordinación y Escalabilidad del Sistema
 
-## Ejecución
+
+### Ejecución
 
 `make up` : Inicia los contenedores del sistema y comienza a seguir los logs de todos ellos en un solo flujo de salida.
 
@@ -14,68 +17,87 @@ En este trabajo se busca familiarizar a los estudiantes con los desafíos de la 
 
 `make switch`: Permite alternar rápidamente entre los archivos de docker compose de los distintos escenarios provistos.
 
-## Elementos del sistema objetivo
 
-![ ](./imgs/diagrama_de_robustez.jpg  "Diagrama de Robustez")
-*Fig. 1: Diagrama de Robustez*
+## 1. Coordinación entre Sum y Aggregation
 
-### Client
+### Distribución de Datos
 
-Lee un archivo de entrada y envía por TCP/IP pares (fruta, cantidad) al sistema.
-Cuando finaliza el envío de datos, aguarda un top de pares (fruta, cantidad) y vuelca el resultado en un archivo de salida csv.
-El criterio y tamaño del top dependen de la configuración del sistema. Por defecto se trata de un top 3 de frutas de acuerdo a la cantidad total almacenada.
+La coordinación entre instancias de **Sum** y **Aggregation** utiliza un esquema de **routing determinístico basado en hash**:
 
-### Gateway
+```python
+    fruit_hash = sum(ord(c) for c in fruit)
+    indice_aggregation = (client_id + fruit_hash) % AGGREGATION_AMOUNT
+```
 
-Es el punto de entrada y salida del sistema. Intercambia mensajes con los clientes y las colas internas utilizando distintos protocolos.
+Esto garantiza que:
+- Una misma fruta de un cliente siempre se envía al mismo Aggregator
+- Los datos se distribuyen uniformemente entre Aggregators
+- No hay procesamiento redundante en Aggregation (cada fruta de cada cliente va a exactamente un Aggregator)
 
-### Sum
- 
-Recibe pares  (fruta, cantidad) y aplica la función Suma de la clase `FruitItem`. Por defecto esa suma es la canónica para los números enteros, ej:
+### Sincronización de EOF
 
-`("manzana", 5) + ("manzana", 8) = ("manzana", 13)`
+**Múltiples instancias de Sum** requieren sincronización para garantizar que todos los datos lleguen antes de computar el top:
 
-Pero su implementación podría modificarse.
-Cuando se detecta el final de la ingesta de datos envía los pares (fruta, cantidad) totales a los Aggregators.
+1. Cada Sum recibe datos de la cola `INPUT_QUEUE` (distribución Round Robin por RabbitMQ)
+2. Cuando un Sum detecta EOF de un cliente, realiza dos acciones:
+   - **Envía datos** a todos los Aggregators (incluidos EOF)
+   - **Notifica** a otros Sums mediante un exchange de control (`SUM_CONTROL_EXCHANGE`)
 
-### Aggregator
+3. Otros Sums reciben esta notificación y evitan procesar el mismo cliente nuevamente mediante `processed_clients`
 
-Consolida los datos de las distintas instancias de Sum.
-Cuando se detecta el final de la ingesta, se calcula un top parcial y se envía esa información al Joiner.
+**Resultado**: Cada Aggregator recibe exactamente `SUM_AMOUNT` mensajes EOF por cliente, garantizando que espere a que todos los Sums hayan terminado antes de computar el top.
 
-### Joiner
+---
 
-Recibe tops parciales de las instancias del Aggregator.
-Cuando se detecta el final de la ingesta, se envía el top final hacia el gateway para ser entregado al cliente.
+## 2. Escalabilidad con Clientes
 
-## Limitaciones del esqueleto provisto
+El sistema soporta **múltiples clientes concurrentes** sin conflictos:
 
-La implementación base respeta la división de responsabilidades de los distintos controles y hace uso de la clase `FruitItem` como un elemento opaco, sin asumir la implementación de las funciones de Suma y Comparación.
+### Multiplexación por cliente_id
 
-No obstante, esta implementación no cubre los objetivos buscados tal y como es presentada. Entre sus falencias puede destactarse que:
+- Cada cliente recibe un `client_id` único asignado por el Gateway
+- Este identificador fluye por todo el pipeline (Sum → Aggregation → Join → Gateway → Client)
+- Los datos de diferentes clientes se procesan **independientemente** en paralelo
 
- - No se implementa la interfaz del middleware. 
- - No se dividen los flujos de datos de los clientes más allá del Gateway, por lo que no se es capaz de resolver múltiples consultas concurrentemente.
- - No se implementan mecanismos de sincronización que permitan escalar los controles Sum y Aggregator. En particular:
-   - Las instancias de Sum se dividen el trabajo, pero solo una de ellas recibe la notificación de finalización en la ingesta de datos.
-   - Las instancias de Sum realizan _broadcast_ a todas las instancias de Aggregator, en lugar de agrupar los datos por algún criterio y evitar procesamiento redundante.
-  - No se maneja la señal SIGTERM, con la salvedad de los clientes y el Gateway.
+### Ventajas
 
-## Condiciones de Entrega
+- **Aislamiento**: datos de clientes no se mezclan
+- **Concurrencia**: múltiples clientes pueden estar en diferentes etapas del procesamiento simultáneamente
+- **Escalabilidad lineal**: el sistema mantiene O(1) overhead por cliente adicional
 
-El código de este repositorio se agrupa en dos carpetas, una para Python y otra para Golang. Los estudiantes deberán elegir **sólo uno** de estos lenguajes y realizar una implementación que funcione correctamente ante cambios en la multiplicidad de los controles (archivo de docker compose), los archivos de entrada y las implementaciones de las funciones de Suma y Comparación del `FruitItem`.
+---
 
-![ ](./imgs/mutabilidad.jpg  "Mutabilidad de Elementos")
-*Fig. 2: Elementos mutables e inmutables*
+## 3. Escalabilidad con Instancias de Controles
 
-A modo de referencia, en la *Figura 2* se marcan en tonos oscuros los elementos que los estudiantes no deben alterar y en tonos claros aquellos sobre los que tienen libertad de decisión.
-Al momento de la evaluación y ejecución de las pruebas se **descartarán** o **reemplazarán** :
+### Sum (escalabilidad horizontal)
 
-- Los archivos de entrada de la carpeta `datasets`.
-- El archivo docker compose principal y los de la carpeta `scenarios`.
-- Todos los archivos Dockerfile.
-- Todo el código del cliente.
-- Todo el código del gateway, salvo `message_handler`.
-- La implementación del protocolo de comunicación externo y `FruitItem`.
+| Instancias | Patrón | Beneficio |
+|---|---|---|
+| 1 | Procesa todos los datos secuencialmente | Simplicidad |
+| N > 1 | Distribución Round Robin por RabbitMQ + sincronización por control_exchange | ↑ Throughput, ↓ Latencia |
 
-Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.
+**Mecanismo**: Cada Sum procesa un subset de clientes (según RabbitMQ), sincroniza EOF mediante broadcast a través del control exchange.
+
+### Aggregation (escalabilidad horizontal)
+
+| Instancias | Patrón | Beneficio |
+|---|---|---|
+| 1 | Un Aggregator recibe todas las frutas de todos los clientes | Simplicidad |
+| N > 1 | Cada Aggregator recibe solo frutas filtradas por `hash(fruta) % AGGREGATION_AMOUNT` | ↑ Throughput, ↓ Latencia |
+
+**Mecanismo**: Cada Aggregator escucha un exchange específico identificado por su ID (`AGGREGATION_PREFIX_{ID}`). Sum ruatea frutas basándose en hash, evitando duplicación.
+
+### Control de Graceful Shutdown
+
+Cada instancia maneja **SIGTERM de manera independiente**:
+
+```python
+signal.signal(signal.SIGTERM, self.handle_sigterm)
+```
+
+1. Al recibir SIGTERM, la instancia marca `self.closed = True`
+2. Deja de procesar nuevos mensajes
+3. Cierra recursos (queues, exchanges, canales)
+4. No afecta a otras instancias (cada una tiene sus propios recursos)
+
+**Resultado**: Escalabilidad sin punto único de fallo en el shutdown.
