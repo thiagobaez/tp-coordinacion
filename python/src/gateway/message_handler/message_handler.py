@@ -1,15 +1,11 @@
-import threading
+import uuid
 from common import message_protocol
 
 
 class MessageHandler:
-    _client_id_counter = 0
-    _lock = threading.Lock()
 
     def __init__(self):
-        with MessageHandler._lock:
-            MessageHandler._client_id_counter += 1
-            self.client_id = MessageHandler._client_id_counter
+        self.client_id = str(uuid.uuid4())
     
     def serialize_data_message(self, message):
         [fruit, amount] = message

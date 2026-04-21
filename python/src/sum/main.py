@@ -52,8 +52,9 @@ class SumFilter:
         ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _get_aggregator_index(self, client_id, fruit):
+        client_hash = sum((i + 1) * ord(c) for i, c in enumerate(str(client_id)))
         fruit_hash = sum(ord(c) for c in fruit)
-        return (client_id + fruit_hash) % AGGREGATION_AMOUNT
+        return (client_hash + fruit_hash) % AGGREGATION_AMOUNT
 
     def _send_to_aggregators(self, client_id):        
         if client_id not in self.amount_by_client:

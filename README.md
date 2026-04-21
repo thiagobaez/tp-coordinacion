@@ -25,9 +25,33 @@
 La coordinación entre instancias de **Sum** y **Aggregation** utiliza un esquema de **routing determinístico basado en hash**:
 
 ```python
+    client_hash = sum((i + 1) * ord(c) for i, c in enumerate(str(client_id)))
     fruit_hash = sum(ord(c) for c in fruit)
-    indice_aggregation = (client_id + fruit_hash) % AGGREGATION_AMOUNT
+    return (client_hash + fruit_hash) % AGGREGATION_AMOUNT
 ```
+
+### ¿Cómo funciona este mini algoritmo de hash?
+
+La idea es transformar la tupla `(client_id, fruit)` en un número entero estable para decidir a qué instancia de Aggregation se envía el dato.
+
+1. `str(client_id)` normaliza el identificador para soportar tanto IDs numéricos como UUIDs.
+2. `client_hash` suma el código ASCII de cada carácter del `client_id`, ponderado por su posición (`i + 1`).
+3. `fruit_hash` suma los códigos ASCII del nombre de la fruta.
+4. Se combinan ambos hashes y se aplica módulo con `AGGREGATION_AMOUNT`.
+
+El índice final es:
+
+```python
+index = (hash(client_id) + hash(fruit)) % AGGREGATION_AMOUNT
+```
+
+Esto aporta tres propiedades importantes:
+
+- Determinismo: la misma pareja `(cliente, fruta)` siempre cae en el mismo Aggregator.
+- Particionado por clave compuesta: dos clientes con la misma fruta no necesariamente caen en el mismo Aggregator.
+- Balance práctico: para datos variados, la distribución entre Aggregators tiende a ser razonablemente uniforme.
+
+Ejemplo rápido: si `AGGREGATION_AMOUNT = 4` y el cálculo da `index = 2`, entonces el mensaje se enruta a `AGGREGATION_PREFIX_2`.
 
 Esto garantiza que:
 - Una misma fruta de un cliente siempre se envía al mismo Aggregator
