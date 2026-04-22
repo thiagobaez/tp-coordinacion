@@ -60,16 +60,40 @@ Esto garantiza que:
 
 ### Sincronización de EOF
 
-**Múltiples instancias de Sum** requieren sincronización para garantizar que todos los datos lleguen antes de computar el top:
+**Múltiples instancias de Sum** requieren coordinación para garantizar que todos los Sums procesen el EOF de cada cliente y envíen sus datos acumulados a los Aggregators.
 
-1. Cada Sum recibe datos de la cola `INPUT_QUEUE` (distribución Round Robin por RabbitMQ)
-2. Cuando un Sum detecta EOF de un cliente, realiza dos acciones:
-   - **Envía datos** a todos los Aggregators (incluidos EOF)
-   - **Notifica** a otros Sums mediante un exchange de control (`SUM_CONTROL_EXCHANGE`)
+#### Flujo de transmisión del EOF
 
-3. Otros Sums reciben esta notificación y evitan procesar el mismo cliente nuevamente mediante `processed_clients`
+1. **Un Sum recibe EOF del cliente** (por `INPUT_QUEUE`):
+   - Acumula todos sus datos para ese cliente en `amount_by_client`
+   - Marca el cliente como procesado: `processed_clients.add(client_id)`
+   - **Envía sus datos acumulados** a todos los Aggregators (routing por hash)
+   - **Envía mensajes de EOF** a todos los Aggregators (un EOF por cada instancia de Aggregation)
+   - Si hay múltiples Sums (`SUM_AMOUNT > 1`), **realiza un broadcast** enviando el `client_id` por el `SUM_CONTROL_EXCHANGE`
 
-**Resultado**: Cada Aggregator recibe exactamente `SUM_AMOUNT` mensajes EOF por cliente, garantizando que espere a que todos los Sums hayan terminado antes de computar el top.
+2. **Otros Sums reciben el broadcast de EOF** (por `SUM_CONTROL_EXCHANGE`):
+   - Verifican si ya procesaron ese cliente (consultando `processed_clients`)
+   - Si no lo procesaron:
+     - Marcan el cliente como procesado
+     - Envían sus datos acumulados a todos los Aggregators
+     - Envían sus mensajes de EOF a todos los Aggregators
+   - **No re-envían el broadcast** (evita ciclos infinitos)
+   - Si ya fue procesado, simplemente descartan el mensaje
+
+#### Por qué funciona
+
+- Cada Aggregator recibe **exactamente `SUM_AMOUNT` mensajes de EOF por cliente** (uno de cada Sum)
+- Esto garantiza que todos los Sums completaron su procesamiento para ese cliente
+- Los Aggregators pueden esperar a recibir los `SUM_AMOUNT` EOFs antes de computar el top
+
+#### Implementación
+
+La coordinación se implementa mediante dos recursos de comunicación:
+
+| Recurso | Propósito | Tipo |
+|--------|-----------|------|
+| `INPUT_QUEUE` | Recibe datos y EOF del cliente | Queue (Round Robin) |
+| `SUM_CONTROL_EXCHANGE` | Broadcast de EOF entre Sums | Exchange (Fanout) |
 
 ---
 
