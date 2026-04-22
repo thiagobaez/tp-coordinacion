@@ -19,7 +19,7 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             self.connection = pika.BlockingConnection(
                 pika.ConnectionParameters(
                     host=self.host,
-                    heartbeat=600,
+                    heartbeat=0,
                     blocked_connection_timeout=300
                 )
             )
@@ -171,7 +171,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                 self.connection = pika.BlockingConnection(
                     pika.ConnectionParameters(
                         host=self.host,
-                        heartbeat=600,
+                        heartbeat=0,
                         blocked_connection_timeout=300
                     )
                 )
