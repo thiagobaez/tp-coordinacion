@@ -30,8 +30,6 @@ La coordinación entre instancias de **Sum** y **Aggregation** utiliza un esquem
     return (client_hash + fruit_hash) % AGGREGATION_AMOUNT
 ```
 
-### ¿Cómo funciona este mini algoritmo de hash?
-
 La idea es transformar la tupla `(client_id, fruit)` en un número entero estable para decidir a qué instancia de Aggregation se envía el dato.
 
 1. `str(client_id)` normaliza el identificador para soportar tanto IDs numéricos como UUIDs.
@@ -131,7 +129,7 @@ El sistema soporta **múltiples clientes concurrentes** sin conflictos:
 | Instancias | Patrón | Beneficio |
 |---|---|---|
 | 1 | Un Aggregator recibe todas las frutas de todos los clientes | Simplicidad |
-| N > 1 | Cada Aggregator recibe solo frutas filtradas por `hash(fruta) % AGGREGATION_AMOUNT` | ↑ Throughput, ↓ Latencia |
+| N > 1 | Cada Aggregator recibe solo frutas filtradas por `hash(cliente) + hash(fruta) % AGGREGATION_AMOUNT` | ↑ Throughput, ↓ Latencia |
 
 **Mecanismo**: Cada Aggregator escucha un exchange específico identificado por su ID (`AGGREGATION_PREFIX_{ID}`). Sum ruatea frutas basándose en hash, evitando duplicación.
 
